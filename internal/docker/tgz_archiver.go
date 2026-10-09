@@ -14,14 +14,23 @@ import (
 
 type TGZArchiver struct {
 	prefix string
+	level  int
 }
 
 func NewTGZArchiver() TGZArchiver {
-	return TGZArchiver{}
+	return TGZArchiver{level: gzip.DefaultCompression}
 }
 
 func (a TGZArchiver) WithPrefix(prefix string) Archiver {
 	a.prefix = prefix
+	return a
+}
+
+// WithCompressionLevel sets the gzip compression level (e.g. gzip.BestSpeed)
+// used by Compress. Callers whose input is already compressed, such as the
+// buildpacks manager, can trade compression ratio for speed.
+func (a TGZArchiver) WithCompressionLevel(level int) TGZArchiver {
+	a.level = level
 	return a
 }
 
@@ -37,9 +46,7 @@ func (a TGZArchiver) Compress(input, output string) error {
 	}
 	defer file.Close()
 
-	// Content (jars, tgz dependencies) is already compressed, so BestSpeed
-	// trades compression ratio for speed without skipping compression.
-	gw, err := gzip.NewWriterLevel(file, gzip.BestSpeed)
+	gw, err := gzip.NewWriterLevel(file, a.level)
 	if err != nil {
 		return fmt.Errorf("failed to create gzip writer: %w", err)
 	}
