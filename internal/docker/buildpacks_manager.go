@@ -132,7 +132,7 @@ func (m BuildpacksManager) Build(workspace, name string) (string, error) {
 	// Another process may remove the shared tarball between the build and the
 	// link, so retry once with a fresh build.
 	for attempt := 0; ; attempt++ {
-		removeSharedLeftovers(sharedDir, shared)
+		removeStaleTemp(sharedDir, shared)
 
 		if _, err := os.Stat(shared); err != nil {
 			err = m.buildShared(sharedDir, key, shared, selected)
@@ -146,11 +146,13 @@ func (m BuildpacksManager) Build(workspace, name string) (string, error) {
 
 		err = os.Link(shared, output)
 		if err == nil {
+			evictOldSharedTarballs(sharedDir)
 			return output, nil
 		}
 
 		err = fs.Copy(shared, output)
 		if err == nil {
+			evictOldSharedTarballs(sharedDir)
 			return output, nil
 		}
 
@@ -214,18 +216,16 @@ func buildpacksKey(buildpacks []Buildpack) (string, error) {
 	return hex.EncodeToString(hash.Sum(nil))[:16], nil
 }
 
-// removeSharedLeftovers keeps the most recently used shared tarballs and
-// removes older ones, plus stale temporary files. Recent temporary files may
-// belong to a concurrent build in another process and are kept. sharedDir is
-// a directory dedicated to shared artifacts, so entries here cannot collide
-// with per-app tarball names.
-func removeSharedLeftovers(sharedDir, shared string) {
+// removeStaleTemp removes temporary staging directories and tmp files older
+// than sharedLeftoverAge, left behind by a killed process. Recent temporary
+// files may belong to a concurrent build in another process and are kept.
+// sharedDir is a directory dedicated to shared artifacts, so entries here
+// cannot collide with per-app tarball names.
+func removeStaleTemp(sharedDir, shared string) {
 	paths, _ := filepath.Glob(filepath.Join(sharedDir, "*"))
 
-	var finished []os.FileInfo
-	finishedPaths := map[os.FileInfo]string{}
 	for _, path := range paths {
-		if path == shared {
+		if path == shared || strings.HasSuffix(path, ".tar.gz") {
 			continue
 		}
 
@@ -234,15 +234,31 @@ func removeSharedLeftovers(sharedDir, shared string) {
 			continue
 		}
 
-		if !info.IsDir() && strings.HasSuffix(path, ".tar.gz") {
-			finished = append(finished, info)
-			finishedPaths[info] = path
-			continue
-		}
-
 		if time.Since(info.ModTime()) > sharedLeftoverAge {
 			_ = os.RemoveAll(path)
 		}
+	}
+}
+
+// evictOldSharedTarballs keeps the sharedKeep most recently used shared
+// tarballs and removes older ones. It runs after a build successfully
+// publishes and links its own tarball, so eviction accounts for every
+// tarball concurrent processes have already published, rather than
+// pruning against a snapshot taken before publication that could let
+// several concurrent cache misses each publish past the retention limit.
+func evictOldSharedTarballs(sharedDir string) {
+	paths, _ := filepath.Glob(filepath.Join(sharedDir, "*.tar.gz"))
+
+	var finished []os.FileInfo
+	finishedPaths := map[os.FileInfo]string{}
+	for _, path := range paths {
+		info, err := os.Stat(path)
+		if err != nil {
+			continue
+		}
+
+		finished = append(finished, info)
+		finishedPaths[info] = path
 	}
 
 	sort.Slice(finished, func(i, j int) bool {
@@ -250,7 +266,7 @@ func removeSharedLeftovers(sharedDir, shared string) {
 	})
 
 	for i, info := range finished {
-		if i >= sharedKeep-1 {
+		if i >= sharedKeep {
 			_ = os.Remove(finishedPaths[info])
 		}
 	}
