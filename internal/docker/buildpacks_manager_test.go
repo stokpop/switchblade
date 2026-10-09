@@ -285,6 +285,34 @@ func testBuildpacksManager(t *testing.T, context spec.G, it spec.S) {
 			Expect(sharedTarballs()).To(ConsistOf(built[1:]))
 		})
 
+		it("reuses the shared tarball when the registry lists buildpacks in another order", func() {
+			_, err := manager.Build(workspace, "some-app")
+			Expect(err).NotTo(HaveOccurred())
+
+			slices.Reverse(registry.ListCall.Returns.BuildpackSlice)
+
+			_, err = manager.Build(workspace, "other-app")
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(archiver.CompressCall.CallCount).To(Equal(1))
+		})
+
+		it("removes stale temporary files when reusing the shared tarball", func() {
+			_, err := manager.Build(workspace, "some-app")
+			Expect(err).NotTo(HaveOccurred())
+
+			stale := filepath.Join(workspace, "shared-0000000000000000.1-1.staging")
+			Expect(os.Mkdir(stale, os.ModePerm)).To(Succeed())
+			old := time.Now().Add(-2 * time.Hour)
+			Expect(os.Chtimes(stale, old, old)).To(Succeed())
+
+			_, err = manager.Build(workspace, "other-app")
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(archiver.CompressCall.CallCount).To(Equal(1))
+			Expect(stale).NotTo(BeADirectory())
+		})
+
 		it("removes stale temporary files but keeps recent ones", func() {
 			stale := filepath.Join(workspace, "shared-0000000000000000.1-1.staging")
 			Expect(os.Mkdir(stale, os.ModePerm)).To(Succeed())

@@ -1,6 +1,7 @@
 package docker
 
 import (
+	"cmp"
 	"crypto/md5"
 	"crypto/sha256"
 	"encoding/hex"
@@ -9,6 +10,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -122,6 +124,8 @@ func (m BuildpacksManager) Build(workspace, name string) (string, error) {
 	// Another process may remove the shared tarball between the build and the
 	// link, so retry once with a fresh build.
 	for attempt := 0; ; attempt++ {
+		removeSharedLeftovers(workspace, shared)
+
 		if _, err := os.Stat(shared); err != nil {
 			err = m.buildShared(workspace, key, shared, selected)
 			if err != nil {
@@ -151,8 +155,15 @@ func (m BuildpacksManager) Build(workspace, name string) (string, error) {
 // buildpacksKey identifies a set of buildpacks by name and URI and, for local
 // files or directories, by the size and modification time of their contents.
 func buildpacksKey(buildpacks []Buildpack) (string, error) {
+	// The registry lists overridden buildpacks in random order, and the order
+	// does not affect the tarball content.
+	sorted := slices.Clone(buildpacks)
+	slices.SortFunc(sorted, func(a, b Buildpack) int {
+		return cmp.Or(cmp.Compare(a.Name, b.Name), cmp.Compare(a.URI, b.URI))
+	})
+
 	hash := sha256.New()
-	for _, buildpack := range buildpacks {
+	for _, buildpack := range sorted {
 		fmt.Fprintf(hash, "%s|%s\n", buildpack.Name, buildpack.URI)
 
 		info, err := os.Stat(buildpack.URI)
@@ -227,8 +238,6 @@ func removeSharedLeftovers(workspace, shared string) {
 }
 
 func (m BuildpacksManager) buildShared(workspace, key, shared string, buildpacks []Buildpack) error {
-	removeSharedLeftovers(workspace, shared)
-
 	unique := fmt.Sprintf("%d-%d", os.Getpid(), time.Now().UnixNano())
 	staging := filepath.Join(workspace, fmt.Sprintf("shared-%s.%s.staging", key, unique))
 	defer os.RemoveAll(staging)
