@@ -111,7 +111,15 @@ func (m BuildpacksManager) Build(workspace, name string) (string, error) {
 		return "", err
 	}
 
-	shared := filepath.Join(workspace, fmt.Sprintf("shared-%s.tar.gz", key))
+	// Shared artifacts live in their own subdirectory so an app name cannot
+	// collide with a shared tarball or temporary file name.
+	sharedDir := filepath.Join(workspace, "shared")
+	err = os.MkdirAll(sharedDir, os.ModePerm)
+	if err != nil {
+		return "", fmt.Errorf("failed to create shared buildpacks directory: %w", err)
+	}
+
+	shared := filepath.Join(sharedDir, fmt.Sprintf("%s.tar.gz", key))
 
 	buildpacksBuildMutex.Lock()
 	defer buildpacksBuildMutex.Unlock()
@@ -124,10 +132,10 @@ func (m BuildpacksManager) Build(workspace, name string) (string, error) {
 	// Another process may remove the shared tarball between the build and the
 	// link, so retry once with a fresh build.
 	for attempt := 0; ; attempt++ {
-		removeSharedLeftovers(workspace, shared)
+		removeSharedLeftovers(sharedDir, shared)
 
 		if _, err := os.Stat(shared); err != nil {
-			err = m.buildShared(workspace, key, shared, selected)
+			err = m.buildShared(sharedDir, key, shared, selected)
 			if err != nil {
 				return "", err
 			}
@@ -176,12 +184,21 @@ func buildpacksKey(buildpacks []Buildpack) (string, error) {
 			continue
 		}
 
-		err = filepath.Walk(buildpack.URI, func(path string, info os.FileInfo, err error) error {
+		// os.Stat follows symlinks, so a symlinked buildpack directory is
+		// classified as a directory here. filepath.Walk uses Lstat though,
+		// and would only visit the symlink itself, leaving the key unchanged
+		// when files beneath the real target change. Walk the resolved path.
+		root, err := filepath.EvalSymlinks(buildpack.URI)
+		if err != nil {
+			return "", fmt.Errorf("failed to resolve buildpack directory: %w", err)
+		}
+
+		err = filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
 			if err != nil {
 				return err
 			}
 
-			rel, err := filepath.Rel(buildpack.URI, path)
+			rel, err := filepath.Rel(root, path)
 			if err != nil {
 				return err
 			}
@@ -199,9 +216,11 @@ func buildpacksKey(buildpacks []Buildpack) (string, error) {
 
 // removeSharedLeftovers keeps the most recently used shared tarballs and
 // removes older ones, plus stale temporary files. Recent temporary files may
-// belong to a concurrent build in another process and are kept.
-func removeSharedLeftovers(workspace, shared string) {
-	paths, _ := filepath.Glob(filepath.Join(workspace, "shared-*"))
+// belong to a concurrent build in another process and are kept. sharedDir is
+// a directory dedicated to shared artifacts, so entries here cannot collide
+// with per-app tarball names.
+func removeSharedLeftovers(sharedDir, shared string) {
+	paths, _ := filepath.Glob(filepath.Join(sharedDir, "*"))
 
 	var finished []os.FileInfo
 	finishedPaths := map[os.FileInfo]string{}
@@ -237,9 +256,9 @@ func removeSharedLeftovers(workspace, shared string) {
 	}
 }
 
-func (m BuildpacksManager) buildShared(workspace, key, shared string, buildpacks []Buildpack) error {
+func (m BuildpacksManager) buildShared(sharedDir, key, shared string, buildpacks []Buildpack) error {
 	unique := fmt.Sprintf("%d-%d", os.Getpid(), time.Now().UnixNano())
-	staging := filepath.Join(workspace, fmt.Sprintf("shared-%s.%s.staging", key, unique))
+	staging := filepath.Join(sharedDir, fmt.Sprintf("%s.%s.staging", key, unique))
 	defer os.RemoveAll(staging)
 
 	tmp := fmt.Sprintf("%s.%s.tmp", shared, unique)
@@ -251,6 +270,15 @@ func (m BuildpacksManager) buildShared(workspace, key, shared string, buildpacks
 
 	err = os.Rename(tmp, shared)
 	if err != nil {
+		// On Windows, Rename cannot replace an existing destination. If a
+		// concurrent process already published the shared tarball, discard
+		// this build and reuse the winner instead of failing; the caller's
+		// link retry handles the shared file disappearing afterwards.
+		if _, statErr := os.Stat(shared); statErr == nil {
+			_ = os.Remove(tmp)
+			return nil
+		}
+
 		_ = os.Remove(tmp)
 		return fmt.Errorf("failed to store buildpacks tarball: %w", err)
 	}
