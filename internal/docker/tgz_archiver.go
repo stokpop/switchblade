@@ -37,7 +37,11 @@ func (a TGZArchiver) Compress(input, output string) error {
 	}
 	defer file.Close()
 
-	gw := gzip.NewWriter(file)
+	// Content (jars, tgz dependencies) is already compressed; skip recompression.
+	gw, err := gzip.NewWriterLevel(file, gzip.BestSpeed)
+	if err != nil {
+		return fmt.Errorf("failed to create gzip writer: %w", err)
+	}
 	defer gw.Close()
 
 	tw := tar.NewWriter(gw)

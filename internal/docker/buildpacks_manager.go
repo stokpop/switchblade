@@ -2,11 +2,17 @@ package docker
 
 import (
 	"crypto/md5"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/paketo-buildpacks/packit/v2/fs"
 	"github.com/paketo-buildpacks/packit/v2/vacation"
@@ -33,7 +39,8 @@ type BuildpacksManager struct {
 	cache    BPCache
 	registry BPRegistry
 
-	filter []string
+	filter         []string
+	disableSharing bool
 }
 
 func NewBuildpacksManager(archiver Archiver, cache BPCache, registry BPRegistry) BuildpacksManager {
@@ -44,17 +51,34 @@ func NewBuildpacksManager(archiver Archiver, cache BPCache, registry BPRegistry)
 	}
 }
 
-func (m BuildpacksManager) Build(workspace, name string) (string, error) {
-	err := os.RemoveAll(filepath.Join(workspace, name))
-	if err != nil {
-		return "", fmt.Errorf("failed to remove existing buildpack directory: %w", err)
-	}
+// buildpacksBuildMutex serializes tarball creation so parallel tests in one
+// process share a single build.
+var buildpacksBuildMutex sync.Mutex
 
+const (
+	// DisableBuildpackCacheEnv, when set to a true value, rebuilds the
+	// buildpacks tarball for every app instead of reusing a shared tarball.
+	DisableBuildpackCacheEnv = "SWITCHBLADE_DISABLE_BUILDPACK_CACHE"
+
+	// sharedKeep is the number of most recently used shared tarballs to keep,
+	// so tests alternating between buildpack sets do not rebuild every time.
+	sharedKeep = 3
+
+	// sharedLeftoverAge is how old an unfinished shared artifact must be before
+	// it is removed, so files still in use by other processes are kept.
+	sharedLeftoverAge = time.Hour
+)
+
+// Build creates the buildpacks tarball once per unique set of buildpacks and
+// hard-links it per app. Rebuilding the tarball for every app is very slow for
+// large cached buildpacks.
+func (m BuildpacksManager) Build(workspace, name string) (string, error) {
 	buildpacks, err := m.registry.List()
 	if err != nil {
 		return "", fmt.Errorf("failed to list buildpacks: %w", err)
 	}
 
+	var selected []Buildpack
 	for _, buildpack := range buildpacks {
 		contains := len(m.filter) == 0
 		for _, name := range m.filter {
@@ -64,52 +88,220 @@ func (m BuildpacksManager) Build(workspace, name string) (string, error) {
 			}
 		}
 
-		if !contains {
+		if contains {
+			selected = append(selected, buildpack)
+		}
+	}
+
+	output := filepath.Join(workspace, fmt.Sprintf("%s.tar.gz", name))
+
+	if m.disableSharing {
+		err = m.buildTarball(filepath.Join(workspace, name), output, selected)
+		if err != nil {
+			return "", err
+		}
+
+		return output, nil
+	}
+
+	key, err := buildpacksKey(selected)
+	if err != nil {
+		return "", err
+	}
+
+	shared := filepath.Join(workspace, fmt.Sprintf("shared-%s.tar.gz", key))
+
+	buildpacksBuildMutex.Lock()
+	defer buildpacksBuildMutex.Unlock()
+
+	err = os.Remove(output)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return "", fmt.Errorf("failed to remove existing buildpacks tarball: %w", err)
+	}
+
+	// Another process may remove the shared tarball between the build and the
+	// link, so retry once with a fresh build.
+	for attempt := 0; ; attempt++ {
+		if _, err := os.Stat(shared); err != nil {
+			err = m.buildShared(workspace, key, shared, selected)
+			if err != nil {
+				return "", err
+			}
+		} else {
+			now := time.Now()
+			_ = os.Chtimes(shared, now, now)
+		}
+
+		err = os.Link(shared, output)
+		if err == nil {
+			return output, nil
+		}
+
+		err = fs.Copy(shared, output)
+		if err == nil {
+			return output, nil
+		}
+
+		if attempt > 0 || !errors.Is(err, os.ErrNotExist) {
+			return "", fmt.Errorf("failed to link buildpacks tarball: %w", err)
+		}
+	}
+}
+
+// buildpacksKey identifies a set of buildpacks by name and URI and, for local
+// files or directories, by the size and modification time of their contents.
+func buildpacksKey(buildpacks []Buildpack) (string, error) {
+	hash := sha256.New()
+	for _, buildpack := range buildpacks {
+		fmt.Fprintf(hash, "%s|%s\n", buildpack.Name, buildpack.URI)
+
+		info, err := os.Stat(buildpack.URI)
+		if err != nil {
 			continue
 		}
 
+		if !info.IsDir() {
+			fmt.Fprintf(hash, "%d|%d\n", info.Size(), info.ModTime().UnixNano())
+			continue
+		}
+
+		err = filepath.Walk(buildpack.URI, func(path string, info os.FileInfo, err error) error {
+			if err != nil {
+				return err
+			}
+
+			rel, err := filepath.Rel(buildpack.URI, path)
+			if err != nil {
+				return err
+			}
+
+			fmt.Fprintf(hash, "%s|%d|%d|%s\n", rel, info.Size(), info.ModTime().UnixNano(), info.Mode())
+			return nil
+		})
+		if err != nil {
+			return "", fmt.Errorf("failed to scan buildpack directory: %w", err)
+		}
+	}
+
+	return hex.EncodeToString(hash.Sum(nil))[:16], nil
+}
+
+// removeSharedLeftovers keeps the most recently used shared tarballs and
+// removes older ones, plus stale temporary files. Recent temporary files may
+// belong to a concurrent build in another process and are kept.
+func removeSharedLeftovers(workspace, shared string) {
+	paths, _ := filepath.Glob(filepath.Join(workspace, "shared-*"))
+
+	var finished []os.FileInfo
+	finishedPaths := map[os.FileInfo]string{}
+	for _, path := range paths {
+		if path == shared {
+			continue
+		}
+
+		info, err := os.Stat(path)
+		if err != nil {
+			continue
+		}
+
+		if !info.IsDir() && strings.HasSuffix(path, ".tar.gz") {
+			finished = append(finished, info)
+			finishedPaths[info] = path
+			continue
+		}
+
+		if time.Since(info.ModTime()) > sharedLeftoverAge {
+			_ = os.RemoveAll(path)
+		}
+	}
+
+	sort.Slice(finished, func(i, j int) bool {
+		return finished[i].ModTime().After(finished[j].ModTime())
+	})
+
+	for i, info := range finished {
+		if i >= sharedKeep-1 {
+			_ = os.Remove(finishedPaths[info])
+		}
+	}
+}
+
+func (m BuildpacksManager) buildShared(workspace, key, shared string, buildpacks []Buildpack) error {
+	removeSharedLeftovers(workspace, shared)
+
+	unique := fmt.Sprintf("%d-%d", os.Getpid(), time.Now().UnixNano())
+	staging := filepath.Join(workspace, fmt.Sprintf("shared-%s.%s.staging", key, unique))
+	defer os.RemoveAll(staging)
+
+	tmp := fmt.Sprintf("%s.%s.tmp", shared, unique)
+	err := m.buildTarball(staging, tmp, buildpacks)
+	if err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+
+	err = os.Rename(tmp, shared)
+	if err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("failed to store buildpacks tarball: %w", err)
+	}
+
+	return nil
+}
+
+func (m BuildpacksManager) buildTarball(staging, output string, buildpacks []Buildpack) error {
+	err := os.RemoveAll(staging)
+	if err != nil {
+		return fmt.Errorf("failed to remove existing buildpack directory: %w", err)
+	}
+
+	err = os.MkdirAll(staging, os.ModePerm)
+	if err != nil {
+		return fmt.Errorf("failed to create buildpack directory: %w", err)
+	}
+
+	for _, buildpack := range buildpacks {
 		bp, err := m.cache.Fetch(buildpack.URI)
 		if err != nil {
-			return "", fmt.Errorf("failed to fetch buildpack: %w", err)
+			return fmt.Errorf("failed to fetch buildpack: %w", err)
 		}
 
 		var isDir bool
 		if file, ok := bp.(interface{ Stat() (os.FileInfo, error) }); ok {
 			info, err := file.Stat()
 			if err != nil {
-				return "", fmt.Errorf("failed to stat buildpack: %w", err)
+				return fmt.Errorf("failed to stat buildpack: %w", err)
 			}
 
 			isDir = info.IsDir()
 		}
 
-		destination := filepath.Join(workspace, name, fmt.Sprintf("%x", md5.Sum([]byte(buildpack.Name))))
+		destination := filepath.Join(staging, fmt.Sprintf("%x", md5.Sum([]byte(buildpack.Name))))
 
 		if isDir {
 			err = fs.Copy(buildpack.URI, destination)
 			if err != nil {
-				return "", fmt.Errorf("failed to copy buildpack: %w", err)
+				return fmt.Errorf("failed to copy buildpack: %w", err)
 			}
 		} else {
 			err = vacation.NewZipArchive(bp).Decompress(destination)
 			if err != nil {
-				return "", fmt.Errorf("failed to decompress buildpack: %w", err)
+				return fmt.Errorf("failed to decompress buildpack: %w", err)
 			}
 		}
 
 		err = bp.Close()
 		if err != nil {
-			return "", fmt.Errorf("failed to close buildpack: %w", err)
+			return fmt.Errorf("failed to close buildpack: %w", err)
 		}
 	}
 
-	output := filepath.Join(workspace, fmt.Sprintf("%s.tar.gz", name))
-	err = m.archiver.WithPrefix("/tmp/buildpacks").Compress(filepath.Join(workspace, name), output)
+	err = m.archiver.WithPrefix("/tmp/buildpacks").Compress(staging, output)
 	if err != nil {
-		return "", fmt.Errorf("failed to archive buildpacks: %w", err)
+		return fmt.Errorf("failed to archive buildpacks: %w", err)
 	}
 
-	return output, nil
+	return nil
 }
 
 func (m BuildpacksManager) Order() (string, bool, error) {
@@ -128,6 +320,13 @@ func (m BuildpacksManager) Order() (string, bool, error) {
 	}
 
 	return strings.Join(names, ","), len(m.filter) > 0, nil
+}
+
+// WithoutSharing rebuilds the buildpacks tarball for every app instead of
+// reusing a shared tarball.
+func (m BuildpacksManager) WithoutSharing() BuildpacksManager {
+	m.disableSharing = true
+	return m
 }
 
 func (m BuildpacksManager) WithBuildpacks(buildpacks ...string) BuildpacksBuilder {

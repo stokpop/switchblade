@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 
 	"github.com/cloudfoundry/switchblade/internal/cloudfoundry"
 	"github.com/cloudfoundry/switchblade/internal/docker"
@@ -86,6 +87,9 @@ func NewPlatform(platformType, token, stack string) (Platform, error) {
 		buildpacksCache := docker.NewBuildpacksCache(filepath.Join(workspace, "buildpacks-cache"))
 		buildpacksRegistry := docker.NewBuildpacksRegistry("https://api.github.com", token)
 		buildpacksManager := docker.NewBuildpacksManager(archiver, buildpacksCache, buildpacksRegistry)
+		if disabled, _ := strconv.ParseBool(os.Getenv(docker.DisableBuildpackCacheEnv)); disabled {
+			buildpacksManager = buildpacksManager.WithoutSharing()
+		}
 		networkManager := docker.NewNetworkManager(dockerClient)
 
 		initialize := docker.NewInitialize(buildpacksRegistry, networkManager)
